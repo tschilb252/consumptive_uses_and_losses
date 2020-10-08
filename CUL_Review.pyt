@@ -6,7 +6,7 @@
 # Name:             CUL_Review.pyt
 # Author:           Methodology developed by Caleb Mccurry, USBR and Troy Wirth, USBR; code by Kelly Meehan, USBR 
 # Created:          20200804
-# Updated:          20200812 
+# Updated:          20201008 
 # Version:          Created using Python 3.6.8 
 
 # Requires:         ArcGIS Pro 
@@ -37,7 +37,7 @@ class Toolbox(object):
         self.alias = "CUL_Review"
 
         # List of tool classes associated with this toolbox
-        self.tools = [Calculate_Annual_Net_Evapotranspiration_by_State_HUC8]
+        self.tools = [Calculate_Annual_Net_Evapotranspiration_by_State_HUC8, Calculate_Monthly_Net_Evapotranspiration_by_State_HUC8]
 
 # I. Calculate_Annual_Net_Evapotranspiration_by_State_HUC8
 
@@ -245,3 +245,198 @@ class Calculate_Annual_Net_Evapotranspiration_by_State_HUC8(object):
         # Export attribute table of State_HUC8 reprojected feature class to directory storing Output Geodatabase
         arcpy.management.CopyRows(in_rows = state_HUC8_NAD83_UTM12N, out_table = 'net_evapotranspiration.csv')
         
+#----------------------------------------------------------------------------------------------
+
+# II. Calculate_Monthly_Net_Evapotranspiration_by_State_HUC8
+
+class Calculate_Monthly_Net_Evapotranspiration_by_State_HUC8(object):
+    def __init__(self):
+        """Define the tool (tool name is the name of the class)."""
+        self.label = "Calculate_Monthly_Net_Evapotranspiration_by_State_HUC8"
+        self.description = ""
+        self.canRunInBackground = False
+        
+    def getParameterInfo(self):
+        """Define parameter definitions"""
+        
+        geodatabase = arcpy.Parameter(
+            displayName="Output Geodatabase",
+            name="Output Geodatabase",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input")
+        
+        path_precip_directory = arcpy.Parameter(
+            displayName="Precipitation Directory",
+            name="Precipitation_Directory",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input")
+        
+        fc_huc8_original = arcpy.Parameter(
+            displayName="State-HUC8 Feature Class",
+            name="State-HUC8_Feature_Class",
+            datatype="DEFeatureClass",
+            parameterType="Required",
+            direction="Input")
+                
+        path_evap_directory = arcpy.Parameter(
+            displayName="Evapotranspiration Directory",
+            name="Evapotranspiration_Directory",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input")
+                 
+        parameters = [geodatabase, path_precip_directory, fc_huc8_original, path_evap_directory]
+        
+        return parameters
+
+    def isLicensed(self):
+        """Set whether tool is licensed to execute."""
+        return True
+
+    def updateParameters(self, parameters):
+        """Modify the values and properties of parameters before internal
+        validation is performed.  This method is called whenever a parameter
+        has been changed."""
+        return
+
+    def updateMessages(self, parameters):
+        """Modify the messages created by internal validation for each tool
+        parameter.  This method is called after internal validation."""
+        return
+
+    def execute(self, parameters, messages):
+        """The source code of the tool."""
+        
+        geodatabase = parameters[0].valueAsText
+        path_precip_directory = parameters[1].valueAsText
+        fc_huc8_original = parameters[2].valueAsText
+        path_evap_directory = parameters[3].valueAsText
+        
+        #--------------------------------------------
+        
+        # 0. Set-up
+        
+        # 0.0 Install necessary packages
+        import arcpy, os, fnmatch, re
+      
+        #--------------------------------------------
+        
+        # 0.1 Set environment settings
+        
+        # Set workspace to output directory
+        arcpy.env.workspace = geodatabase
+                
+        # Overwrite output
+        arcpy.env.overwriteOutput = True
+        
+        # 0.2 Check out Spatial Analyst Extension
+        arcpy.CheckOutExtension('Spatial')
+        
+        # 0.3 Change working directory to output directory
+        os.chdir(geodatabase)
+        
+
+        #----------------------------------------------------------------------------------------------
+        
+        # 1. Copy State-HUC8 feature class into geodatabase
+        
+        fc_huc8 = os.path.join(geodatabase, os.path.splitext(os.path.basename(fc_huc8_original))[0])
+        arcpy.CopyFeatures_management(in_features = fc_huc8_original, out_feature_class = fc_huc8)
+        
+        #----------------------------------------------------------------------------------------------
+        
+        # 2. Calculate mean precipitation per State-HUC8 per monthly raster
+        
+        # Create list of rasters using list comprehension 
+        list_precip_rasters = [os.path.join(dirpath, i)
+            for dirpath, dirnames, filenames in os.walk(path_precip_directory)
+            for i in fnmatch.filter(filenames, '*.bil')]
+        
+        # Set snap raster environment setting (otherwise Extract by Mask may shift raster)
+        arcpy.env.snapRaster = list_precip_rasters[0]
+        
+        # Generate a table of mean precipitation by State-HUC8 zone for each year; join values to State-HUC8 reprojected feature class
+        
+        for r in list_precip_rasters:
+            date = re.split('[_.]', os.path.basename(r))[1]
+            table_mean_precip = os.path.join(geodatabase, 'PRISM_' + date + '_Mean_Zonal_Precipitation')
+            arcpy.sa.ZonalStatisticsAsTable(in_zone_data = fc_huc8, zone_field = 'OBJECTID', in_value_raster = r, out_table = table_mean_precip, statistics_type = 'MEAN') 
+            arcpy.JoinField_management(in_data = fc_huc8, in_field = 'OBJECTID', join_table = table_mean_precip, join_field = 'OBJECTID_1', fields = 'MEAN')
+            arcpy.AddField_management(in_table = fc_huc8, field_name = 'ppt_' + date, field_type = 'FLOAT')
+            arcpy.CalculateField_management(in_table = fc_huc8, field = 'ppt_' + date, expression = "!MEAN!", expression_type = 'PYTHON3')
+            arcpy.DeleteField_management(in_table = fc_huc8, drop_field = 'MEAN')
+            arcpy.Delete_management(table_mean_precip)
+        
+        #----------------------------------------------------------------------------------------------
+        
+        # 2. Calculate mean evapotranspiration rate per State-HUC8 for each calendar month
+        
+        # Create list of rasters by using a list comprehension to collect the yearly average raster while iterating through nested directories recursively
+        list_evap_rasters = [os.path.join(dirpath, e)
+            for dirpath, dirnames, filenames in os.walk(path_evap_directory)
+            for e in fnmatch.filter(filenames, '*.bil')]
+        
+        # Extract cell size from precipitation rasters
+        
+        cell_size_x_result = arcpy.GetRasterProperties_management(in_raster = list_precip_rasters[0], property_type = 'CELLSIZEX')
+        cell_size_x = cell_size_x_result.getOutput(0)
+        cell_size_y_result = arcpy.GetRasterProperties_management(in_raster = list_precip_rasters[0], property_type = 'CELLSIZEY')
+        cell_size_y = cell_size_y_result.getOutput(0)
+        size_x_y = cell_size_x + ' ' + cell_size_y
+        
+        # Resample the twelve calendar month evapotranspiration rasters using cell size of precipitation rasters
+        
+        for j in list_evap_rasters:
+            
+            # Clip each monthly evap raster   
+            raster_evap_clipped = os.path.join(geodatabase, os.path.splitext(os.path.basename(j))[0] + '_clipped')  
+            out_evap_clipped = arcpy.sa.ExtractByMask(in_raster = j, in_mask_data = fc_huc8)
+            out_evap_clipped.save(raster_evap_clipped)
+            
+            # Resample each raster    
+            raster_evap_resampled = os.path.join(geodatabase, os.path.splitext(os.path.basename(j))[0] + '_resampled')
+            arcpy.Resample_management(in_raster = out_evap_clipped, out_raster = raster_evap_resampled, cell_size = size_x_y, resampling_type = 'BILINEAR')
+        
+            # Generate a table of evapotranspiration rates per State-HUC8; join values to State-HUC8 reprojected feature class
+            table_mean_evap = os.path.join(geodatabase, 'Evap_Mean_Rate')
+            arcpy.sa.ZonalStatisticsAsTable(in_zone_data = fc_huc8, zone_field = 'OBJECTID', in_value_raster = raster_evap_resampled, out_table = table_mean_evap, statistics_type = 'MEAN') 
+        
+            # Join data
+            arcpy.JoinField_management(in_data = fc_huc8, in_field = 'OBJECTID', join_table = table_mean_evap, join_field = 'OBJECTID_1', fields = 'MEAN')
+            month = re.split('[., _]', os.path.basename(j))[2]
+            field_evapotranspiration = 'evap_' + month
+            arcpy.AddField_management(in_table = fc_huc8, field_name = field_evapotranspiration, field_type = 'FLOAT')
+            arcpy.CalculateField_management(in_table = fc_huc8, field = field_evapotranspiration, expression = "!MEAN!", expression_type = 'PYTHON3')
+            arcpy.DeleteField_management(in_table = fc_huc8, drop_field = 'MEAN')
+        
+        #----------------------------------------------------------------------------------------------
+        
+        # 3. Calculate monthly net evapotranspiration (inches) per State-HUC8 from 1970 - 2018 using the formula: net evapotranspiration = (evapotranspiration (millimeters) - precipitation)/25.4 
+        
+        fields_prism = [field.name for field in arcpy.ListFields(dataset = fc_huc8, wild_card = 'ppt_*')]
+        fields_evap = [field.name for field in arcpy.ListFields(dataset = fc_huc8, wild_card = 'evap_*')]
+        
+        def calculate_net_evap_inches():
+            for i in fields_prism:
+                date = re.split('[_]', i)[1]
+                month_precip = re.split('[_]', i)[1][-2:]
+                field_net_evap = 'net_evap_' + date
+                if arcpy.ListFields(dataset = fc_huc8, wild_card = field_net_evap):
+                    arcpy.DeleteField_management(in_table = fc_huc8, drop_field = field_net_evap)
+                arcpy.AddField_management(in_table = fc_huc8, field_name = field_net_evap, field_type = 'FLOAT')
+                for j in fields_evap:
+                    month_evap = re.split('[_]', j)[1]
+                    fields_in_iteration = [field_net_evap, j, i]
+                    with arcpy.da.UpdateCursor(in_table = fc_huc8, field_names = fields_in_iteration) as cursor: 
+                        for row in cursor:
+                            if row[1] is not None and row[2] is not None:
+                                if month_evap == month_precip:
+                                    row[0] = (row[1] - row[2])/25.4 # Divide by 25.4 to convert from milimeters to inches
+                            cursor.updateRow(row)
+        
+        calculate_net_evap_inches()            
+        
+        # Export attribute table of feature class to csv
+        arcpy.management.CopyRows(in_rows = fc_huc8, out_table = 'net_monthly_evapotranspiration.csv')
