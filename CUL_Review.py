@@ -5,7 +5,7 @@
 # Name:             Calculate_Stockpond_Consumptive_Use.py
 # Author:           Methodology developed by Caleb Mccurry, USBR and Troy Wirth, USBR; code by Kelly Meehan, USBR 
 # Created:          20200804
-# Updated:          20200813 
+# Updated:          20201001 
 # Version:          Created using Python 3.6.8 
 
 # Requires:         ArcGIS Pro 
@@ -54,8 +54,8 @@ path_prism_directory = arcpy.GetParameterAsText(1)
 # User selects original State-HUC8 feature class
 fc_huc8_original = arcpy.GetParameterAsText(2)
 
-# User selects evapotranspiration raster (Estimated Mean Monthly Evapotranspiration 1956 - 1970 raster) from https://cida.usgs.gov/thredds/ncss/mows/pe/dataset.html
-raster_evap_original = arcpy.GetParameterAsText(3)
+# User selects directory with monthly evapotranspiration rasters (Estimated Mean Monthly Evapotranspiration 1956 - 1970 raster) from https://cida.usgs.gov/thredds/ncss/mows/pe/dataset.html
+path_evap_directory = arcpy.GetParameterAsText(3)
 
 #--------------------------------------------
 
@@ -63,7 +63,6 @@ raster_evap_original = arcpy.GetParameterAsText(3)
 
 # Set workspace to output directory
 arcpy.env.workspace = geodatabase
-
 
 #Overwrite output
 arcpy.env.overwriteOutput = True
@@ -90,7 +89,6 @@ state_HUC8_NAD83_UTM12N_buffered = os.path.join(geodatabase, 'state_HUC8_NAD83_U
 arcpy.Buffer_analysis(in_features = state_HUC8_NAD83_UTM12N, out_feature_class = state_HUC8_NAD83_UTM12N_buffered, buffer_distance_or_field = '20000 Meters', dissolve_option = 'ALL')
 
 # Create list of rasters by using a list comprehension to collect the yearly average raster while iterating through nested directories recursively
-
 list_prism_rasters = [os.path.join(dirpath, f)
     for dirpath, dirnames, filenames in os.walk(path_prism_directory)
     for f in fnmatch.filter(filenames, 'PRISM_ppt_stable_4kmM?_????_bil.bil')]
@@ -119,14 +117,53 @@ for r in list_prism_reprojected:
 # 2. Calculate mean evapotranspiration rate per State-HUC8 
 
 # Set snap raster environment setting (otherwise Extract by Mask may shift raster)
-arcpy.env.snapRaster = raster_evap_original
+arcpy.env.snapRaster = path_evap_directory[0]
 
-# Extract Raster by Mask
+# Set spacial reference
+spatial_reference = arcpy.SpatialReference(26912)
 
-raster_evap_clipped = os.path.join(geodatabase, os.path.splitext(os.path.basename(raster_evap_original))[0] + '_clipped')  
-out_evap_clipped = arcpy.sa.ExtractByMask(in_raster = raster_evap_original, in_mask_data = state_HUC8_NAD83_UTM12N_buffered)
-out_evap_clipped.save(raster_evap_clipped)
+# Create list of rasters by using a list comprehension to collect the yearly average raster while iterating through nested directories recursively
+list_evap_rasters = [os.path.join(dirpath, e)
+    for dirpath, dirnames, filenames in os.walk(path_evap_directory)
+    for e in fnmatch.filter(filenames, '*.bil')]
 
+# Create a list originally comprised of raw rasters that are replaced if necessary with reprojected ones 
+raster_list = list_evap_rasters
+
+for (i, raster) in enumerate(raster_list):
+    wkid_raster = arcpy.Describe(raster).spatialReference.factoryCode
+    arcpy.AddMessage('The spatial reference of ' + raster + ' has a well-known ID (WKID) of: ' + str(wkid_raster))
+    print(raster + 'The spatial reference of ' + raster + ' has a well-known ID (WKID) of: ' + str(wkid_raster))
+    
+    # If the raster has a projection other than that of Edited Field Borders Shapefile, replace itself with a reprojected version 
+    if wkid_raster != 26912:
+        arcpy.AddMessage('The spatial reference of ' + raster + ' has a well-known ID (WKID) different from 26912; reprojecting.')
+        print('The spatial reference of ' + raster + ' has a well-known ID (WKID) different from 26912; reprojecting.')
+        raster_name = os.path.basename(raster)
+        reprojected_raster_name = raster_name.rsplit(sep = '.', maxsplit = 1)[0]
+        reprojected_raster = os.path.join(geodatabase, reprojected_raster_name)
+
+        # Check if pre-existing raster exists and delete if so
+        if arcpy.Exists(reprojected_raster):
+            arcpy.Delete_management(in_data = reprojected_raster)
+            arcpy.AddMessage('Deleted pre-existing reprojected raster: ' + reprojected_raster)
+        
+        # Reproject raster
+        arcpy.ProjectRaster_management(in_raster = raster, out_raster = reprojected_raster, out_coor_system = spatial_reference)
+        arcpy.AddMessage('Generated: ' + reprojected_raster)
+        
+        # Replace original raster with that of reprojected raster
+        raster_list[i] = reprojected_raster
+        
+    else:
+        arcpy.AddMessage(raster + ' projection matches NAD83 UTM12N; reprojection not necessary.')
+
+for r in raster_list:
+    # Clip each monthly evap raster   
+    raster_evap_clipped = os.path.join(geodatabase, os.path.splitext(os.path.basename(r))[0] + '_clipped')  
+    out_evap_clipped = arcpy.sa.ExtractByMask(in_raster = r, in_mask_data = state_HUC8_NAD83_UTM12N_buffered)
+    out_evap_clipped.save(raster_evap_clipped)
+    
 # Reproject evapotranspiration raster to GCS NAD83 and PCS UTM12N
 
 raster_evap_reprojected = os.path.join(geodatabase, 'Evapotranspiration_NAD83_UTM12N')
@@ -189,3 +226,10 @@ calculate_net_evap_inches()
 
 # Export attribute table of State_HUC8 reprojected feature class
 arcpy.management.CopyRows(in_rows = state_HUC8_NAD83_UTM12N, out_table = 'net_evapotranspiration.csv')
+
+# TTDL
+# subtract prism from appropriate month evap raster instead of static single raster
+# Add check for both prism rasters and monthly evap that projection is the same 
+# Carry over changes from 
+# Make WKID a variable but set default value
+# Change name of reprojected raster to be dynamicly named to user defined EPSG code
